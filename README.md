@@ -1,6 +1,7 @@
 # **NOTE**
 
 This is a fork of the original [TvDatafeed](https://github.com/rongardF/tvdatafeed.git) project by StreamAlpha. This fork has live data retrieving feature implemented. 
+  - ADD: This is a fork of <https://github.com/rongardF/tvdatafeed> repository.
 More information about this will be found in the TvDatafeedLive section down below in the README.
 
 # **TvDatafeed**
