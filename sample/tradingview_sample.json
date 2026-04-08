@@ -1,0 +1,9 @@
+{
+    "username": "<tradingview email>",
+    "password": "<tradingview password>",
+    "sessionid": "<sessionid cookie>",
+    "sessionid_sign": "<sessionid_sign cookie>",
+    "sessionid_exp": "2006-01-02T15:03:04",
+    "auth_token": "<auth token>",
+    "auth_token_exp": "2006-01-02T15:03:04"
+}
