@@ -106,8 +106,8 @@ class TvDatafeed:
 
         self.ws = None
         self._ws_connected = False
-        self.session = self.__generate_session()
-        self.chart_session = self.__generate_chart_session()
+        self.session = None
+        self.chart_session = None
 
     def __try_login(self, account):
         """tradingview_login 호출 공통 로직. RateLimitError는 caller에게 전파."""
@@ -186,24 +186,37 @@ class TvDatafeed:
         return self._ws_connected and self.ws is not None
 
     def connect(self):
-        """웹소켓 연결을 생성한다. 기존 연결이 있으면 닫고 새로 만든다."""
+        """웹소켓 연결을 생성한다."""
         self.__create_connection()
         self._ws_connected = True
         logger.debug("websocket connected")
 
     def disconnect(self):
-        """웹소켓 연결을 종료한다."""
+        """웹소켓 연결을 종료한다. 활성 세션을 서버에서 삭제 후 연결을 닫는다."""
         if self.ws is not None:
+            try:
+                if self.session is not None:
+                    self.__send_message("quote_delete_session", [self.session])
+                    self.session = None
+                if self.chart_session is not None:
+                    self.__send_message("chart_delete_session", [self.chart_session])
+                    self.chart_session = None
+            except Exception:
+                pass
             try:
                 self.ws.close()
             except Exception:
                 pass
             self.ws = None
+        self.session = None
+        self.chart_session = None
         self._ws_connected = False
         logger.debug("websocket disconnected")
 
+
     def reconnect(self):
         """웹소켓을 재연결한다."""
+        logger.debug("websocket reconnecting")
         self.disconnect()
         self.connect()
 
@@ -341,6 +354,7 @@ class TvDatafeed:
 
         if not self.is_connected():
             self.connect()
+
         self.session = self.__generate_session()
         self.chart_session = self.__generate_chart_session()
 
@@ -414,10 +428,10 @@ class TvDatafeed:
                 break
             if self.keepalive(result):
                 continue
-            # 현재 chart_session 메시지만 수집 (이전 세션 잔여 메시지 무시)
             if self.chart_session not in result:
                 continue
-            raw_data_parts.append(result)
+            if "timescale_update" in result:
+                raw_data_parts.append(result)
             if "series_completed" in result:
                 break
 
