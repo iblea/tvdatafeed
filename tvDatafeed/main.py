@@ -382,15 +382,23 @@ class TvDatafeed:
 
         return self.__create_df("\n".join(raw_data_parts), symbol)
 
+    __search_headers = {
+        "Origin": "https://www.tradingview.com",
+        "Referer": "https://www.tradingview.com/",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    }
+
     def search_symbol(self, text: str, exchange: str = ''):
         url = self.__search_url.format(text, exchange)
 
         symbols_list = []
         try:
-            resp = requests.get(url, timeout=10)
+            resp = requests.get(url, headers=self.__search_headers, timeout=10)
+            resp.raise_for_status()
 
-            symbols_list = json.loads(resp.text.replace(
-                '</em>', '').replace('<em>', ''))
+            clean_text = re.sub(r"</?em>", "", resp.text)
+            symbols_list = json.loads(clean_text)
         except Exception as e:
             logger.error(e)
 
