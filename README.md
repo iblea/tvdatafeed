@@ -16,7 +16,7 @@ If you found the content useful and want to support my work, you can buy me a co
 This module can be installed from github repo
 
 ```sh
-pip install --upgrade --no-cache-dir git+https://github.com/rongardF/tvdatafeed.git
+pip install --upgrade --no-cache-dir git+https://github.com/iblea/tvdatafeed.git
 ```
 
 For usage instructions, watch these videos-
