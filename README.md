@@ -60,6 +60,130 @@ when using without login, following warning will be shown `you are using nologin
 
 ---
 
+## Authentication
+
+This fork supports session-based authentication for TradingView.
+
+### Authentication Methods
+
+TradingView uses two authentication credentials:
+
+| Credential | Validity | Renewal Method |
+|------------|----------|----------------|
+| `sessionid` cookie | 93 days (managed at 91-day threshold) | Manual extraction from browser |
+| `auth_token` (JWT) | 4 hours (managed at 10 min before expiry) | `POST /quote_token/` |
+
+`auth_token` is required for WebSocket data retrieval. To obtain an `auth_token`, a valid `sessionid` cookie is needed.
+
+### Auth Class Structure
+
+```
+Auth
+├── UserAccount (uid, pw)
+├── UserCookie (sessionid, sessionid_sign, expires_at)
+│   └── is_expired() → checks expires_at
+└── UserAuthToken (auth_token, expires_at)
+    └── is_expired() → checks expires_at (JWT exp - 10 min)
+    └── _parse_exp() → extracts exp from JWT payload, subtracts 10 min
+```
+
+### Initialization
+
+```python
+from tvDatafeed import TvDatafeed, Interval
+from tvDatafeed.auth import Auth, load_tv_auth_data
+
+# 1. Initialize with Auth object (recommended)
+auth = load_tv_auth_data("auth_cache.json")
+tv = TvDatafeed(auth=auth)
+
+# 2. Pass Auth object as positional argument
+tv = TvDatafeed(auth)
+
+# 3. Initialize with individual fields
+tv = TvDatafeed(
+    sessionid="...",
+    sessionid_sign="...",
+    sessionid_exp="2006-04-04T15:04:05",
+    auth_token="eyJhbGciOi...",
+    auth_token_exp="2006-01-02T18:54:05",
+)
+
+# 4. ID/PW login (legacy, may be blocked by rate_limit)
+tv = TvDatafeed(username="user@example.com", password="password")
+
+# 5. Without login
+tv = TvDatafeed()
+```
+
+### Authentication Flow
+
+When initializing TvDatafeed, authentication is attempted in the following order:
+
+```
+1. Cookie Validation
+   ├── No sessionid or unknown expires_at → attempt login → fallback to no-login
+   └── sessionid_exp elapsed → attempt login → fallback to no-login
+
+2. Token Validation (cookie is valid)
+   ├── No auth_token → refresh
+   ├── auth_token_exp elapsed → refresh
+   └── auth_token valid → use as-is
+
+3. Refresh (POST /quote_token/)
+   ├── Success → use new token
+   └── Failure → retry login
+
+4. Login (POST /accounts/signin/)
+   ├── Success → use token
+   └── Failure → no-login mode (unauthorized_user_token)
+```
+
+### Saving / Loading Auth Data
+
+Auth data can be saved to a JSON file and reused across sessions.
+
+```python
+from tvDatafeed.auth import save_tv_auth_data, load_tv_auth_data
+
+# Save
+save_tv_auth_data(tv.auth, "auth_cache.json")
+
+# Load
+auth = load_tv_auth_data("auth_cache.json")
+tv = TvDatafeed(auth=auth)
+```
+
+#### Storage Format
+
+```json
+{
+  "username": "user@example.com",
+  "password": "password",
+  "sessionid": "xxxxxxxxxxxxxxx",
+  "sessionid_sign": "v3:xxxxxxxxxxxxxxx",
+  "sessionid_exp": "2006-04-04T15:04:05",
+  "auth_token": "eyJhbGciOi...",
+  "auth_token_exp": "2006-01-02T18:54:05"
+}
+```
+
+| Field | Description | Expiry Check |
+|-------|-------------|--------------|
+| `username` | TradingView username | - |
+| `password` | TradingView password | - |
+| `sessionid` | Session cookie value | - |
+| `sessionid_sign` | Session signature cookie value | - |
+| `sessionid_exp` | Session expiry time (login time + 91 days) | Expired if `now >= sessionid_exp` |
+| `auth_token` | JWT string | - |
+| `auth_token_exp` | Token expiry time (JWT exp - 10 min) | Expired if `now >= auth_token_exp` |
+
+- If `auth_token_exp` has not passed, the cached token is reused.
+- If `auth_token_exp` has passed, a new token is obtained via `POST /quote_token/` using the `sessionid`.
+- If `sessionid_exp` has passed, the sessionid must be re-extracted from the browser.
+
+---
+
 ## Getting Data
 
 To download the data use `tv.get_hist` method.

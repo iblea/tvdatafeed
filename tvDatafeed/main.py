@@ -1,4 +1,4 @@
-import datetime
+from datetime import datetime
 import enum
 import json
 import logging
@@ -8,7 +8,6 @@ import string
 import pandas as pd
 from websocket import create_connection
 import requests
-import json
 
 logger = logging.getLogger(__name__)
 
@@ -30,30 +29,77 @@ class Interval(enum.Enum):
 
 
 class TvDatafeed:
-    __sign_in_url = 'https://www.tradingview.com/accounts/signin/'
     __search_url = 'https://symbol-search.tradingview.com/symbol_search/?text={}&hl=1&exchange={}&lang=en&type=&domain=production'
     __ws_headers = json.dumps({"Origin": "https://data.tradingview.com"})
-    __signin_headers = {'Referer': 'https://www.tradingview.com'}
     __ws_timeout = 5
 
     def __init__(
         self,
         username: str = None,
         password: str = None,
+        sessionid: str = None,
+        sessionid_sign: str = None,
+        auth_token: str = None,
+        sessionid_exp: str = None,
+        auth_token_exp: str = None,
+        auth = None,
     ) -> None:
         """Create TvDatafeed object
 
         Args:
             username (str, optional): tradingview username. Defaults to None.
             password (str, optional): tradingview password. Defaults to None.
+            sessionid (str, optional): tradingview sessionid cookie. Defaults to None.
+            sessionid_sign (str, optional): tradingview sessionid_sign cookie. Defaults to None.
+            auth_token (str, optional): tradingview auth token (JWT). Defaults to None.
+            sessionid_exp (str, optional): sessionid expires at (ISO format). Defaults to None.
+            auth_token_exp (str, optional): auth_token expires at (ISO format). Defaults to None.
+            auth (Auth, optional): Auth object. Defaults to None.
         """
 
-        self.ws_debug = False
+        from .auth import Auth, UserAccount, UserCookie, UserAuthToken
 
-        self.token = self.__auth(username, password)
+        self.ws_debug = False
+        self.auth = None
+        self._auth_error = None
+
+        # 첫 번째 positional argument가 Auth 객체인 경우
+        if isinstance(username, Auth):
+            auth = username
+            username = None
+
+        # 개별 필드로 Auth 객체 구성
+        if auth is None:
+            account = UserAccount(uid=username, pw=password) if username and password else None
+
+            cookie = None
+            if sessionid and sessionid_sign:
+                expires_at = None
+                if sessionid_exp:
+                    try:
+                        expires_at = datetime.fromisoformat(sessionid_exp)
+                    except (ValueError, TypeError):
+                        logger.warning(f"sessionid_exp 파싱 실패: {sessionid_exp}")
+                cookie = UserCookie(sessionid=sessionid, sessionid_sign=sessionid_sign, expires_at=expires_at)
+
+            user_token = None
+            if auth_token:
+                expires_at = None
+                if auth_token_exp:
+                    try:
+                        expires_at = datetime.fromisoformat(auth_token_exp)
+                    except (ValueError, TypeError):
+                        logger.warning(f"auth_token_exp 파싱 실패: {auth_token_exp}")
+                user_token = UserAuthToken(auth_token=auth_token, expires_at=expires_at)
+
+            auth = Auth(account=account, cookie=cookie, auth_token=user_token)
+
+        self.token = self.__auth(auth)
 
         if self.token is None:
             self.token = "unauthorized_user_token"
+            if self._auth_error is None:
+                self._auth_error = "no credentials provided"
             logger.warning(
                 "you are using nologin method, data you access may be limited"
             )
@@ -62,27 +108,74 @@ class TvDatafeed:
         self.session = self.__generate_session()
         self.chart_session = self.__generate_chart_session()
 
-    def __auth(self, username, password):
+    def __try_login(self, account):
+        """tradingview_login 호출 공통 로직. RateLimitError는 caller에게 전파."""
+        from .auth import tradingview_login
 
-        if (username is None or password is None):
-            token = None
+        if not account:
+            self._auth_error = "no credentials for login"
+            return None
+        auth_result, login_err = tradingview_login(account)
+        if auth_result:
+            self.auth = auth_result
+            return auth_result.get_token()
+        self._auth_error = login_err or "login failed (unknown)"
+        return None
 
-        else:
-            data = {"username": username,
-                    "password": password,
-                    "remember": "on"}
-            try:
-                response = requests.post(
-                    url=self.__sign_in_url, data=data, headers=self.__signin_headers)
-                token = response.json()['user']['auth_token']
-            except Exception as e:
-                logger.error('error while signin')
-                token = None
+    def __auth(self, auth):
+        from .auth import refresh_auth_token, RateLimitError
 
-        return token
+        account = auth.account
+        cookie = auth.cookie
+
+        try:
+            # 1. Cookie 검증
+            if cookie and cookie.is_expired():
+                logger.warning("sessionid expired")
+                cookie = None
+
+            if cookie is None:
+                return self.__try_login(account)
+
+            # 2. Token 검증 (cookie는 유효한 상태)
+            if auth.auth_token and not auth.auth_token.is_expired():
+                logger.info("cached auth_token is valid")
+                self.auth = auth
+                return auth.get_token()
+            if auth.auth_token:
+                logger.info("auth_token expired")
+
+            # 3. Token 없거나 만료 → refresh
+            self.auth = auth
+            token = refresh_auth_token(self.auth)
+            if token:
+                logger.info("auth_token refreshed via /quote_token/")
+                return token
+            logger.warning("quote_token refresh failed")
+
+            # 4. Refresh 실패 → login 시도
+            if account:
+                logger.info("refresh failed, attempting login")
+                return self.__try_login(account)
+            self._auth_error = "token refresh failed, no credentials for login"
+
+        except RateLimitError as e:
+            self._auth_error = f"rate limit: {e}"
+            logger.error(f"rate limit 감지, 인증 중단: {e}")
+
+        return None
+
+    def get_errmsg(self) -> str:
+        """인증 실패 시 상세 사유를 반환한다. 인증 성공 시 None."""
+        return self._auth_error
 
     def __create_connection(self):
         logging.debug("creating websocket connection")
+        if self.ws is not None:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
         self.ws = create_connection(
             "wss://data.tradingview.com/socket.io/websocket", headers=self.__ws_headers, timeout=self.__ws_timeout
         )
@@ -98,20 +191,12 @@ class TvDatafeed:
             logger.error("error in filter_raw_message")
 
     @staticmethod
-    def __generate_session():
-        stringLength = 12
-        letters = string.ascii_lowercase
-        random_string = "".join(random.choice(letters)
-                                for i in range(stringLength))
-        return "qs_" + random_string
+    def __generate_session(prefix="qs_"):
+        return prefix + "".join(random.choice(string.ascii_lowercase) for _ in range(12))
 
     @staticmethod
     def __generate_chart_session():
-        stringLength = 12
-        letters = string.ascii_lowercase
-        random_string = "".join(random.choice(letters)
-                                for i in range(stringLength))
-        return "cs_" + random_string
+        return TvDatafeed.__generate_session("cs_")
 
     @staticmethod
     def __prepend_header(st):
@@ -133,14 +218,14 @@ class TvDatafeed:
     @staticmethod
     def __create_df(raw_data, symbol):
         try:
-            out = re.search('"s":\[(.+?)\}\]', raw_data).group(1)
+            out = re.search(r'"s":\[(.+?)\}\]', raw_data).group(1)
             x = out.split(',{"')
             data = list()
             volume_data = True
 
             for xi in x:
-                xi = re.split("\[|:|,|\]", xi)
-                ts = datetime.datetime.fromtimestamp(float(xi[4]))
+                xi = re.split(r"\[|:|,|\]", xi)
+                ts = datetime.fromtimestamp(float(xi[4]))
 
                 row = [ts]
 
@@ -213,6 +298,8 @@ class TvDatafeed:
 
         interval = interval.value
 
+        self.session = self.__generate_session()
+        self.chart_session = self.__generate_chart_session()
         self.__create_connection()
 
         self.__send_message("set_auth_token", [self.token])
@@ -273,28 +360,34 @@ class TvDatafeed:
         self.__send_message("switch_timezone", [
                             self.chart_session, "exchange"])
 
-        raw_data = ""
+        raw_data_parts = []
 
         logger.debug(f"getting data for {symbol}...")
-        while True:
+        try:
+            while True:
+                try:
+                    result = self.ws.recv()
+                    raw_data_parts.append(result)
+                except Exception as e:
+                    logger.error(e)
+                    break
+
+                if "series_completed" in result:
+                    break
+        finally:
             try:
-                result = self.ws.recv()
-                raw_data = raw_data + result + "\n"
-            except Exception as e:
-                logger.error(e)
-                break
+                self.ws.close()
+            except Exception:
+                pass
 
-            if "series_completed" in result:
-                break
-
-        return self.__create_df(raw_data, symbol)
+        return self.__create_df("\n".join(raw_data_parts), symbol)
 
     def search_symbol(self, text: str, exchange: str = ''):
         url = self.__search_url.format(text, exchange)
 
         symbols_list = []
         try:
-            resp = requests.get(url)
+            resp = requests.get(url, timeout=10)
 
             symbols_list = json.loads(resp.text.replace(
                 '</em>', '').replace('<em>', ''))
