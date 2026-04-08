@@ -414,6 +414,9 @@ class TvDatafeed:
                 break
             if self.keepalive(result):
                 continue
+            # 현재 chart_session 메시지만 수집 (이전 세션 잔여 메시지 무시)
+            if self.chart_session not in result:
+                continue
             raw_data_parts.append(result)
             if "series_completed" in result:
                 break
