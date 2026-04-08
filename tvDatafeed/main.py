@@ -31,7 +31,7 @@ class Interval(enum.Enum):
 class TvDatafeed:
     __search_url = 'https://symbol-search.tradingview.com/symbol_search/?text={}&hl=1&exchange={}&lang=en&type=&domain=production'
     __ws_headers = json.dumps({"Origin": "https://data.tradingview.com"})
-    __ws_timeout = 5
+    __ws_timeout = 10
 
     def __init__(
         self,
@@ -105,6 +105,7 @@ class TvDatafeed:
             )
 
         self.ws = None
+        self._ws_connected = False
         self.session = self.__generate_session()
         self.chart_session = self.__generate_chart_session()
 
@@ -179,6 +180,46 @@ class TvDatafeed:
         self.ws = create_connection(
             "wss://data.tradingview.com/socket.io/websocket", headers=self.__ws_headers, timeout=self.__ws_timeout
         )
+
+    def is_connected(self):
+        """웹소켓 연결 상태를 반환한다."""
+        return self._ws_connected and self.ws is not None
+
+    def connect(self):
+        """웹소켓 연결을 생성한다. 기존 연결이 있으면 닫고 새로 만든다."""
+        self.__create_connection()
+        self._ws_connected = True
+        logger.debug("websocket connected")
+
+    def disconnect(self):
+        """웹소켓 연결을 종료한다."""
+        if self.ws is not None:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
+        self._ws_connected = False
+        logger.debug("websocket disconnected")
+
+    def reconnect(self):
+        """웹소켓을 재연결한다."""
+        self.disconnect()
+        self.connect()
+
+    def keepalive(self, msg):
+        """TradingView heartbeat(~h~) 메시지를 echo back한다.
+
+        Returns: heartbeat이면 True, 아니면 False
+        """
+        if "~h~" not in msg:
+            return False
+        try:
+            self.ws.send(msg)
+        except Exception as e:
+            logger.error(f"keepalive failed: {e}")
+            self._ws_connected = False
+        return True
 
     @staticmethod
     def __filter_raw_message(text):
@@ -298,9 +339,10 @@ class TvDatafeed:
 
         interval = interval.value
 
+        if not self.is_connected():
+            self.connect()
         self.session = self.__generate_session()
         self.chart_session = self.__generate_chart_session()
-        self.__create_connection()
 
         self.__send_message("set_auth_token", [self.token])
         self.__send_message("chart_create_session", [self.chart_session, ""])
@@ -363,22 +405,18 @@ class TvDatafeed:
         raw_data_parts = []
 
         logger.debug(f"getting data for {symbol}...")
-        try:
-            while True:
-                try:
-                    result = self.ws.recv()
-                    raw_data_parts.append(result)
-                except Exception as e:
-                    logger.error(e)
-                    break
-
-                if "series_completed" in result:
-                    break
-        finally:
+        while True:
             try:
-                self.ws.close()
-            except Exception:
-                pass
+                result = self.ws.recv()
+            except Exception as e:
+                logger.error(e)
+                self._ws_connected = False
+                break
+            if self.keepalive(result):
+                continue
+            raw_data_parts.append(result)
+            if "series_completed" in result:
+                break
 
         return self.__create_df("\n".join(raw_data_parts), symbol)
 
