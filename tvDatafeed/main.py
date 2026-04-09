@@ -5,6 +5,7 @@ import logging
 import random
 import re
 import string
+import time
 import pandas as pd
 from websocket import create_connection
 import requests
@@ -419,7 +420,11 @@ class TvDatafeed:
         raw_data_parts = []
 
         logger.debug(f"getting data for {symbol}...")
+        recv_start = time.time()
         while True:
+            if time.time() - recv_start > self.__ws_timeout:
+                logger.error("recv loop timeout")
+                break
             try:
                 result = self.ws.recv()
             except Exception as e:
@@ -435,7 +440,225 @@ class TvDatafeed:
             if "series_completed" in result:
                 break
 
+        # 세션 정리 (다음 get_hist 호출 시 세션 누적 방지)
+        try:
+            if self.session is not None:
+                self.__send_message("quote_delete_session", [self.session])
+            if self.chart_session is not None:
+                self.__send_message("chart_delete_session", [self.chart_session])
+        except Exception:
+            pass
+        self.session = None
+        self.chart_session = None
+
         return self.__create_df("\n".join(raw_data_parts), symbol)
+
+    def get_hist_batch(
+        self,
+        requests: list,
+        batch_size: int = 4,
+        batch_sleep: float = 0.5,
+    ) -> list:
+        """여러 심볼/타임프레임의 히스토리 데이터를 batch로 조회한다.
+
+        하나의 WebSocket 연결 위에 batch_size개의 chart_session을 동시에 생성하여
+        병렬로 데이터를 수신한다. quote_session은 생성하지 않는다.
+
+        Args:
+            requests: list of dict. 각 dict는 다음 키를 포함:
+                - symbol (str): 심볼명 (예: "NQ1!")
+                - exchange (str): 거래소 (예: "CME_MINI")
+                - interval (Interval): 타임프레임
+                - count (int): 조회할 바 수 (기본 10)
+                - fut_contract (int, optional): 선물 계약 (기본 None)
+                - extended_session (bool, optional): 확장 세션 (기본 False)
+            batch_size: 동시 chart_session 수 (기본 4)
+
+        Returns:
+            list[dict]: 각 요청에 대한 결과 (순서 보존).
+                - symbol, exchange, interval, count: 입력값 그대로
+                - data (pd.DataFrame | None): 성공 시 DataFrame
+                - error (str | None): 실패 시 에러 메시지
+            None: WS 연결 실패 등 치명적 에러
+        """
+        if not requests:
+            return []
+
+        try:
+            if not self.is_connected():
+                self.connect()
+            self.__send_message("set_auth_token", [self.token])
+        except Exception as e:
+            logger.error(f"get_hist_batch: connection/auth failed: {e}")
+            return None
+
+        results = []
+        batches = [requests[i:i+batch_size] for i in range(0, len(requests), batch_size)]
+
+        for batch_idx, batch in enumerate(batches):
+            if batch_idx > 0 and batch_sleep > 0:
+                time.sleep(batch_sleep)
+            logger.info(f"processing batch {batch_idx+1}/{len(batches)} ({len(batch)} requests)")
+            for req in batch:
+                logger.debug(f"  {req['exchange']}:{req['symbol']} {req['interval'].value} n={req.get('count', 10)}")
+            batch_results = self._process_batch(batch)
+
+            if batch_results is None:
+                for remaining_batch in batches[batch_idx+1:]:
+                    for req in remaining_batch:
+                        results.append({
+                            "symbol": req["symbol"],
+                            "exchange": req["exchange"],
+                            "interval": req["interval"],
+                            "count": req.get("count", 10),
+                            "data": None,
+                            "error": "skipped due to prior batch failure",
+                        })
+                break
+
+            results.extend(batch_results)
+
+        return results
+
+    def _process_batch(self, batch):
+        """단일 batch 처리.
+
+        Returns:
+            list[dict]: batch 내 각 요청의 결과
+            None: WS 치명적 에러 (연결 끊김 등)
+        """
+        session_map = {}
+
+        # chart_session 생성 + 메시지 전송
+        for req in batch:
+            cs_id = self.__generate_chart_session()
+            symbol = self.__format_symbol(
+                symbol=req["symbol"],
+                exchange=req["exchange"],
+                contract=req.get("fut_contract"),
+            )
+            interval_val = req["interval"].value
+            n_bars = req.get("count", 10)
+            extended = req.get("extended_session", False)
+
+            session_map[cs_id] = {
+                "req": req,
+                "symbol_formatted": symbol,
+                "raw_data_parts": [],
+                "completed": False,
+                "error": None,
+            }
+
+            self.__send_message("chart_create_session", [cs_id, ""])
+            self.__send_message("resolve_symbol", [
+                cs_id, "symbol_1",
+                '={"symbol":"' + symbol + '","adjustment":"splits","session":'
+                + ('"regular"' if not extended else '"extended"') + "}",
+            ])
+            self.__send_message("create_series", [
+                cs_id, "s1", "s1", "symbol_1", interval_val, n_bars,
+            ])
+            self.__send_message("switch_timezone", [cs_id, "exchange"])
+
+        # recv 루프 (chart_session ID 기반 demux, 패킷 단위 분리)
+        pending_count = len(session_map)
+        recv_start = time.time()
+        ws_fatal = False
+
+        while pending_count > 0:
+            if time.time() - recv_start > self.__ws_timeout:
+                logger.error("batch recv loop timeout")
+                for cs_id, info in session_map.items():
+                    if not info["completed"]:
+                        info["error"] = "recv timeout"
+                break
+
+            try:
+                result = self.ws.recv()
+            except Exception as e:
+                logger.error(f"batch recv error: {e}")
+                self._ws_connected = False
+                ws_fatal = True
+                for cs_id, info in session_map.items():
+                    if not info["completed"]:
+                        info["error"] = f"ws recv error: {e}"
+                break
+
+            if self.keepalive(result):
+                continue
+
+            # ~m~{length}~m~ 프로토콜 기반 패킷 분리 (protocol.js 참조)
+            packets = re.split(r'~m~\d+~m~', result)
+
+            for packet in packets:
+                if not packet:
+                    continue
+
+                matched_cs = None
+                for cs_id in session_map:
+                    if cs_id in packet:
+                        matched_cs = cs_id
+                        break
+                if matched_cs is None:
+                    continue
+
+                info = session_map[matched_cs]
+                if info["completed"]:
+                    continue
+
+                # 유효 데이터 수신 시 타이머 리셋
+                recv_start = time.time()
+
+                if "symbol_error" in packet or "critical_error" in packet:
+                    info["error"] = "symbol resolve failed"
+                    info["completed"] = True
+                    pending_count -= 1
+                    continue
+
+                if "timescale_update" in packet:
+                    info["raw_data_parts"].append(packet)
+                if "series_completed" in packet:
+                    info["completed"] = True
+                    pending_count -= 1
+
+        # 세션 정리
+        if not ws_fatal:
+            for cs_id in session_map:
+                try:
+                    self.__send_message("chart_delete_session", [cs_id])
+                except Exception:
+                    pass
+
+        # 결과 생성
+        batch_results = []
+        for cs_id, info in session_map.items():
+            req = info["req"]
+            entry = {
+                "symbol": req["symbol"],
+                "exchange": req["exchange"],
+                "interval": req["interval"],
+                "count": req.get("count", 10),
+                "data": None,
+                "error": info["error"],
+            }
+
+            if info["error"] is None:
+                if info["raw_data_parts"]:
+                    raw = "\n".join(info["raw_data_parts"])
+                    df = self.__create_df(raw, info["symbol_formatted"])
+                    if df is not None:
+                        entry["data"] = df
+                    else:
+                        entry["error"] = "no data, please check the exchange and symbol"
+                else:
+                    entry["error"] = "no timescale_update received"
+
+            batch_results.append(entry)
+
+        if ws_fatal:
+            return None
+
+        return batch_results
 
     __search_headers = {
         "Origin": "https://www.tradingview.com",
